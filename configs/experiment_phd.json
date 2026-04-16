@@ -1,0 +1,25 @@
+{
+  "experiment_name": "fp_crossplatform",
+  "output_root": "runs",
+  "seed": 4040,
+  "inputs": {
+    "num_tensors": 8,
+    "tensor_names": ["a", "b", "c", "d", "e", "f", "g", "h"],
+    "num_elements": 1000000,
+    "shape": [1000000],
+    "dtype": "float32",
+    "distribution": "normal",
+    "uniform_low": -0.25,
+    "uniform_high": 0.25,
+    "normal_mean": 0,
+    "normal_std": 1,
+    "save_formats": ["pt", "bin", "txt"]
+  },
+  "execution": {
+    "load_format": "pt",
+    "save_step_formats": ["pt", "bin", "txt"],
+    "save_final_formats": ["pt", "bin", "txt"],
+    "deterministic_algorithms": false,
+    "disable_tf32": true
+  }
+}
