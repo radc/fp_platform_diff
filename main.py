@@ -47,13 +47,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     compare_parser = subparsers.add_parser(
-        "compare", help="Compare two execution folders step by step"
+        "compare",
+        help="Compare one reference execution folder against one or more candidate folders",
     )
     compare_parser.add_argument(
         "--reference", type=Path, required=True, help="Reference execution directory"
     )
     compare_parser.add_argument(
-        "--candidate", type=Path, required=True, help="Candidate execution directory"
+        "--candidate",
+        type=Path,
+        nargs="+",
+        required=True,
+        help="One or more candidate execution directories",
     )
     compare_parser.add_argument(
         "--format",
@@ -89,7 +94,7 @@ def main() -> None:
     elif args.command == "compare":
         compare_runs(
             reference_dir=args.reference,
-            candidate_dir=args.candidate,
+            candidate_dirs=args.candidate,
             tensor_format=args.format,
             rtol=args.rtol,
             atol=args.atol,
