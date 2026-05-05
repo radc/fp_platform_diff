@@ -1,5 +1,5 @@
 {
-  "experiment_name": "fp_crossplatform",
+  "experiment_name": "exp1_norm_0_1_fp32",
   "output_root": "runs",
   "seed": 4040,
   "inputs": {
@@ -19,7 +19,7 @@
     "load_format": "pt",
     "save_step_formats": ["pt", "bin", "txt"],
     "save_final_formats": ["pt", "bin", "txt"],
-    "deterministic_algorithms": false,
+    "deterministic_algorithms": true,
     "disable_tf32": true
   }
 }

@@ -1,4 +1,4 @@
-EXPERIMENT_FILE=configs/experiment_phd.json
+EXPERIMENT_FILE=configs/exp1_norm_0_1_fp32.json
 
 experiment_name=$(uname -n)
 experiment_name="${experiment_name//[^[:alnum:]]/}"
