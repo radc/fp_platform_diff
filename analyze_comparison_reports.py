@@ -38,6 +38,22 @@ import numpy as np
 import pandas as pd
 
 
+IEEE_MATRIX_CMAP = "cividis"
+RATE_PERCENT_COLUMNS = {
+    "unequal_element_rate",
+    "divergent_tensor_step_rate",
+    "exact_equal_tensor_step_rate",
+    "allclose_rate",
+    "divergent_rate",
+    "exact_equal_rate",
+    "same_shape_rate",
+    "global_unequal_element_rate",
+    "a_to_b_unequal_rate",
+    "b_to_a_unequal_rate",
+    "abs_diff_unequal_rate",
+}
+
+
 # -----------------------------------------------------------------------------
 # Argument parsing and utilities
 # -----------------------------------------------------------------------------
@@ -123,6 +139,55 @@ def shorten(text: Optional[str], max_len: int) -> str:
     if len(text) <= max_len:
         return text
     return text[: max_len - 1] + "…"
+
+
+def is_percent_metric(column_name: str) -> bool:
+    """Return True when a fraction-like metric should be displayed as percent."""
+    return (
+        column_name in RATE_PERCENT_COLUMNS
+        or column_name.endswith("_rate")
+        or "_rate_" in column_name
+        or "fraction_unequal" in column_name
+    )
+
+
+def percent_label(column_name: str) -> str:
+    """Return an axis/title label for metrics displayed as percentages."""
+    return f"{column_name} (%)" if is_percent_metric(column_name) else column_name
+
+
+def display_metric_series(series: pd.Series, column_name: str) -> pd.Series:
+    """Scale fraction-like metric values to percentages for display/output."""
+    if is_percent_metric(column_name):
+        return series.astype(float) * 100.0
+    return series
+
+
+def display_metric_matrix(matrix: pd.DataFrame, column_name: str) -> pd.DataFrame:
+    """Scale fraction-like matrix values to percentages for display/output."""
+    if is_percent_metric(column_name):
+        return matrix.astype(float) * 100.0
+    return matrix
+
+
+def annotation_text_color(value: float, finite_values: np.ndarray) -> str:
+    """Choose black/white text for readable heatmap annotations."""
+    if math.isnan(value) or finite_values.size == 0:
+        return "black"
+    vmin = float(np.min(finite_values))
+    vmax = float(np.max(finite_values))
+    if math.isclose(vmin, vmax):
+        return "black"
+    normalized = (value - vmin) / (vmax - vmin)
+    return "white" if normalized < 0.45 else "black"
+
+
+def get_ieee_colormap(cmap_name: str = IEEE_MATRIX_CMAP):
+    """Return a colorblind-friendly colormap with a light missing-value color."""
+    base_cmap = plt.get_cmap(cmap_name)
+    cmap = base_cmap.copy() if hasattr(base_cmap, "copy") else base_cmap
+    cmap.set_bad(color="#f2f2f2")
+    return cmap
 
 
 def parse_name_map_entries(entries: Sequence[str]) -> Dict[str, str]:
@@ -544,7 +609,11 @@ def load_report_family(paths: Sequence[Path], name_map: Dict[str, str]) -> Tuple
 
 
 def save_csv(df: pd.DataFrame, path: Path) -> None:
-    df.to_csv(path, index=False)
+    output_df = df.copy()
+    for column in output_df.columns:
+        if is_percent_metric(column) and pd.api.types.is_numeric_dtype(output_df[column]):
+            output_df[column] = output_df[column] * 100.0
+    output_df.to_csv(path, index=False)
 
 
 def aggregate_platform_role(pair_df: pd.DataFrame, role_column: str) -> pd.DataFrame:
@@ -761,17 +830,19 @@ def plot_numeric_heatmap(
     matrix: pd.DataFrame,
     title: str,
     output_path: Path,
-    cmap: str = "viridis",
+    cmap: str = IEEE_MATRIX_CMAP,
     value_format: str = ".3g",
+    colorbar_label: str = "Value",
 ) -> None:
     if matrix.empty:
         return
 
     values = matrix.to_numpy(dtype=float)
     masked = np.ma.masked_invalid(values)
+    finite_values = values[np.isfinite(values)]
 
     fig, ax = plt.subplots(figsize=(1.2 * max(6, len(matrix.columns)), 0.9 * max(5, len(matrix.index))))
-    im = ax.imshow(masked, cmap=cmap, aspect="auto")
+    im = ax.imshow(masked, cmap=get_ieee_colormap(cmap), aspect="auto")
 
     ax.set_title(title)
     ax.set_xticks(range(len(matrix.columns)))
@@ -783,10 +854,18 @@ def plot_numeric_heatmap(
         for j in range(matrix.shape[1]):
             val = values[i, j]
             text = "-" if math.isnan(val) else format(val, value_format)
-            ax.text(j, i, text, ha="center", va="center", fontsize=8)
+            ax.text(
+                j,
+                i,
+                text,
+                ha="center",
+                va="center",
+                fontsize=8,
+                color=annotation_text_color(val, finite_values),
+            )
 
     cbar = fig.colorbar(im, ax=ax)
-    cbar.ax.set_ylabel("Value", rotation=-90, va="bottom")
+    cbar.ax.set_ylabel(colorbar_label, rotation=-90, va="bottom")
     fig.tight_layout()
     fig.savefig(output_path, dpi=200, bbox_inches="tight")
     plt.close(fig)
@@ -798,16 +877,18 @@ def plot_text_heatmap(
     title: str,
     output_path: Path,
     max_annotation_len: int,
-    cmap: str = "magma",
+    cmap: str = IEEE_MATRIX_CMAP,
+    colorbar_label: str = "Color scale",
 ) -> None:
     if matrix_values.empty or matrix_colors.empty:
         return
 
     color_values = matrix_colors.to_numpy(dtype=float)
     masked = np.ma.masked_invalid(color_values)
+    finite_values = color_values[np.isfinite(color_values)]
 
     fig, ax = plt.subplots(figsize=(1.2 * max(6, len(matrix_values.columns)), 0.9 * max(5, len(matrix_values.index))))
-    im = ax.imshow(masked, cmap=cmap, aspect="auto")
+    im = ax.imshow(masked, cmap=get_ieee_colormap(cmap), aspect="auto")
 
     ax.set_title(title)
     ax.set_xticks(range(len(matrix_values.columns)))
@@ -818,11 +899,20 @@ def plot_text_heatmap(
     for i in range(matrix_values.shape[0]):
         for j in range(matrix_values.shape[1]):
             raw_value = matrix_values.iloc[i, j]
+            color_value = color_values[i, j]
             text = shorten(None if pd.isna(raw_value) else str(raw_value), max_annotation_len) or "-"
-            ax.text(j, i, text, ha="center", va="center", fontsize=8)
+            ax.text(
+                j,
+                i,
+                text,
+                ha="center",
+                va="center",
+                fontsize=8,
+                color=annotation_text_color(color_value, finite_values),
+            )
 
     cbar = fig.colorbar(im, ax=ax)
-    cbar.ax.set_ylabel("Color scale", rotation=-90, va="bottom")
+    cbar.ax.set_ylabel(colorbar_label, rotation=-90, va="bottom")
     fig.tight_layout()
     fig.savefig(output_path, dpi=200, bbox_inches="tight")
     plt.close(fig)
@@ -846,9 +936,10 @@ def plot_top_bar(
     plot_df = plot_df.iloc[::-1]
 
     fig, ax = plt.subplots(figsize=(10, max(5, 0.35 * len(plot_df))))
-    ax.barh(plot_df[category_col].astype(str), plot_df[value_col].astype(float))
+    values = display_metric_series(plot_df[value_col], value_col)
+    ax.barh(plot_df[category_col].astype(str), values.astype(float), color="#4b6f8f")
     ax.set_title(title)
-    ax.set_xlabel(value_col)
+    ax.set_xlabel(percent_label(value_col))
     ax.set_ylabel(category_col)
     fig.tight_layout()
     fig.savefig(output_path, dpi=200, bbox_inches="tight")
@@ -999,12 +1090,12 @@ def analyze_family(
     save_csv(sym_df, output_dir / f"{family_name}_symmetry_analysis.csv")
 
     numeric_matrix_specs = [
-        ("unequal_element_rate", ".3g", "viridis"),
-        ("divergent_tensor_step_count", ".0f", "magma"),
-        ("divergent_tensor_step_rate", ".3g", "magma"),
-        ("exact_equal_tensor_step_count", ".0f", "cividis"),
-        ("exact_equal_tensor_step_rate", ".3g", "cividis"),
-        ("total_unequal_elements", ".3g", "plasma"),
+        ("unequal_element_rate", ".2f", IEEE_MATRIX_CMAP),
+        ("divergent_tensor_step_count", ".0f", IEEE_MATRIX_CMAP),
+        ("divergent_tensor_step_rate", ".2f", IEEE_MATRIX_CMAP),
+        ("exact_equal_tensor_step_count", ".0f", IEEE_MATRIX_CMAP),
+        ("exact_equal_tensor_step_rate", ".2f", IEEE_MATRIX_CMAP),
+        ("total_unequal_elements", ".3g", IEEE_MATRIX_CMAP),
     ]
 
     for value_col, fmt, cmap in numeric_matrix_specs:
@@ -1013,13 +1104,15 @@ def analyze_family(
         matrix = build_matrix(pair_df, value_col)
         if matrix.empty:
             continue
-        matrix.to_csv(output_dir / f"{family_name}_matrix_{value_col}.csv")
+        display_matrix = display_metric_matrix(matrix, value_col)
+        display_matrix.to_csv(output_dir / f"{family_name}_matrix_{value_col}.csv")
         plot_numeric_heatmap(
-            matrix,
-            title=f"{family_name}: {value_col}",
+            display_matrix,
+            title=f"{family_name}: {percent_label(value_col)}",
             output_path=output_dir / f"{family_name}_matrix_{value_col}.png",
             cmap=cmap,
             value_format=fmt,
+            colorbar_label=percent_label(value_col),
         )
 
     text_specs = [
@@ -1027,7 +1120,11 @@ def analyze_family(
         "first_divergent_family",
         "first_divergent_step",
     ]
-    color_reference_matrix = build_matrix(pair_df, "unequal_element_rate") if "unequal_element_rate" in pair_df.columns else pd.DataFrame()
+    color_reference_matrix = (
+        display_metric_matrix(build_matrix(pair_df, "unequal_element_rate"), "unequal_element_rate")
+        if "unequal_element_rate" in pair_df.columns
+        else pd.DataFrame()
+    )
 
     for value_col in text_specs:
         if value_col not in pair_df.columns or color_reference_matrix.empty:
@@ -1039,10 +1136,11 @@ def analyze_family(
         plot_text_heatmap(
             matrix_values=matrix_text,
             matrix_colors=color_reference_matrix,
-            title=f"{family_name}: {value_col}",
+            title=f"{family_name}: {value_col} (colored by unequal_element_rate %)",
             output_path=output_dir / f"{family_name}_matrix_{value_col}.png",
             max_annotation_len=max_annotation_len,
-            cmap="magma",
+            cmap=IEEE_MATRIX_CMAP,
+            colorbar_label="unequal_element_rate (%)",
         )
 
     outputs["num_ok_pair_reports"] = int((pair_df["status"] == "ok").sum()) if "status" in pair_df.columns else 0
@@ -1116,6 +1214,7 @@ def main() -> None:
     summary_lines.append(f"Full reports found: {len(full_paths)}")
     summary_lines.append(f"Error-only reports found: {len(error_paths)}")
     summary_lines.append(f"Failed comparison reports found: {len(failed_reports_df)}")
+    summary_lines.append("Rate and fraction metrics in CSV and matrix outputs are reported as percentages.")
     summary_lines.append("")
     if name_map:
         summary_lines.append("Friendly label mappings:")
