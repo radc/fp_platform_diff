@@ -1,18 +1,21 @@
 #!/usr/bin/env python3
-"""Analyze full and error-only cross-platform comparison reports.
+"""Analyze cross-platform comparison reports.
 
-This script extends the previous error-oriented analyzer to support two kinds of
-JSON reports produced by the floating-point comparison pipeline:
+This script extends the previous error-oriented analyzer to support three kinds
+of JSON reports produced by the floating-point comparison pipeline:
 
 1. Full comparison reports, which contain the key ``comparisons`` and therefore
    include *all* evaluated operations, including those that match exactly.
 2. Error-only comparison reports, which contain the key ``divergent_steps`` and
    therefore include only the operations that diverged.
+3. Failed comparison reports, which contain failure metadata such as ``status``
+   and ``error_message`` but no per-step numeric comparison payload.
 
-The script can analyze both report families in a single run and writes separate
+The script can analyze these report families in a single run and writes separate
 CSV/PNG outputs for:
-- all-step analysis (based on full reports), and
-- error-only analysis (based on error reports).
+- all-step analysis (based on full reports),
+- error-only analysis (based on error reports), and
+- failed report inventory/summary output.
 
 It also generates NxN platform matrices, summaries by operation/family/group,
 patch-size analyses, and symmetry analyses comparing A->B against B->A.
@@ -33,6 +36,22 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+
+
+IEEE_MATRIX_CMAP = "cividis"
+RATE_PERCENT_COLUMNS = {
+    "unequal_element_rate",
+    "divergent_tensor_step_rate",
+    "exact_equal_tensor_step_rate",
+    "allclose_rate",
+    "divergent_rate",
+    "exact_equal_rate",
+    "same_shape_rate",
+    "global_unequal_element_rate",
+    "a_to_b_unequal_rate",
+    "b_to_a_unequal_rate",
+    "abs_diff_unequal_rate",
+}
 
 
 # -----------------------------------------------------------------------------
@@ -105,7 +124,7 @@ def ensure_dir(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
 
 
-def load_json(path: Path) -> Dict[str, Any]:
+def load_json(path: Path) -> Any:
     with path.open("r", encoding="utf-8") as f:
         return json.load(f)
 
@@ -120,6 +139,55 @@ def shorten(text: Optional[str], max_len: int) -> str:
     if len(text) <= max_len:
         return text
     return text[: max_len - 1] + "…"
+
+
+def is_percent_metric(column_name: str) -> bool:
+    """Return True when a fraction-like metric should be displayed as percent."""
+    return (
+        column_name in RATE_PERCENT_COLUMNS
+        or column_name.endswith("_rate")
+        or "_rate_" in column_name
+        or "fraction_unequal" in column_name
+    )
+
+
+def percent_label(column_name: str) -> str:
+    """Return an axis/title label for metrics displayed as percentages."""
+    return f"{column_name} (%)" if is_percent_metric(column_name) else column_name
+
+
+def display_metric_series(series: pd.Series, column_name: str) -> pd.Series:
+    """Scale fraction-like metric values to percentages for display/output."""
+    if is_percent_metric(column_name):
+        return series.astype(float) * 100.0
+    return series
+
+
+def display_metric_matrix(matrix: pd.DataFrame, column_name: str) -> pd.DataFrame:
+    """Scale fraction-like matrix values to percentages for display/output."""
+    if is_percent_metric(column_name):
+        return matrix.astype(float) * 100.0
+    return matrix
+
+
+def annotation_text_color(value: float, finite_values: np.ndarray) -> str:
+    """Choose black/white text for readable heatmap annotations."""
+    if math.isnan(value) or finite_values.size == 0:
+        return "black"
+    vmin = float(np.min(finite_values))
+    vmax = float(np.max(finite_values))
+    if math.isclose(vmin, vmax):
+        return "black"
+    normalized = (value - vmin) / (vmax - vmin)
+    return "white" if normalized < 0.45 else "black"
+
+
+def get_ieee_colormap(cmap_name: str = IEEE_MATRIX_CMAP):
+    """Return a colorblind-friendly colormap with a light missing-value color."""
+    base_cmap = plt.get_cmap(cmap_name)
+    cmap = base_cmap.copy() if hasattr(base_cmap, "copy") else base_cmap
+    cmap.set_bad(color="#f2f2f2")
+    return cmap
 
 
 def parse_name_map_entries(entries: Sequence[str]) -> Dict[str, str]:
@@ -305,11 +373,22 @@ def operation_group_for_paper(normalized_name: str) -> str:
 # -----------------------------------------------------------------------------
 
 
-def detect_report_kind(report: Dict[str, Any]) -> str:
+def detect_report_kind(report: Any, path: Optional[Path] = None) -> str:
+    """Classify a comparison report JSON payload.
+
+    Supported report kinds are:
+    - ``full``: complete comparison reports with a ``comparisons`` array.
+    - ``errors``: error-only reports with a ``divergent_steps`` array.
+    - ``failed``: comparison jobs that failed before per-step metrics were emitted.
+    """
+    if not isinstance(report, dict):
+        return "unknown"
     if "comparisons" in report:
         return "full"
     if "divergent_steps" in report:
         return "errors"
+    if report.get("status") == "failed" or {"status", "error_message"}.issubset(report):
+        return "failed"
     return "unknown"
 
 
@@ -319,6 +398,33 @@ def iter_report_items(report: Dict[str, Any], report_kind: str) -> Iterable[Dict
     if report_kind == "errors":
         return report.get("divergent_steps", [])
     return []
+
+
+def extract_failed_report_row(
+    *,
+    report_path: Path,
+    report: Dict[str, Any],
+    reference_raw: str,
+    candidate_raw: str,
+    reference_label: str,
+    candidate_label: str,
+) -> Dict[str, Any]:
+    """Extract a row for a report that failed before step-level comparison."""
+    return {
+        "report_path": str(report_path),
+        "reference_dir": report.get("reference_dir"),
+        "candidate_dir": report.get("candidate_dir"),
+        "reference_raw": reference_raw,
+        "candidate_raw": candidate_raw,
+        "reference_label": reference_label,
+        "candidate_label": candidate_label,
+        "platform_pair": f"{reference_label} -> {candidate_label}",
+        "status": report.get("status"),
+        "error_message": report.get("error_message"),
+        "tensor_format": report.get("tensor_format"),
+        "atol": report.get("atol"),
+        "rtol": report.get("rtol"),
+    }
 
 
 def step_row_from_item(
@@ -377,13 +483,18 @@ def step_row_from_item(
         "first_diff_reference_value": item.get("first_diff_reference_value"),
         "first_diff_candidate_value": item.get("first_diff_candidate_value"),
         "status": item.get("status"),
+        "error_type": item.get("error_type"),
+        "error_message": item.get("error_message"),
+        "reference_function_name": item.get("reference_function_name"),
+        "candidate_function_name": item.get("candidate_function_name"),
     }
 
 
-def load_report_family(paths: Sequence[Path], name_map: Dict[str, str]) -> Tuple[pd.DataFrame, pd.DataFrame, List[str]]:
-    """Load one family of reports and return pair-level and step-level frames."""
+def load_report_family(paths: Sequence[Path], name_map: Dict[str, str]) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, List[str]]:
+    """Load one family of reports and return pair-, step-, and failed-report frames."""
     pair_rows: List[Dict[str, Any]] = []
     step_rows: List[Dict[str, Any]] = []
+    failed_rows: List[Dict[str, Any]] = []
     warnings: List[str] = []
 
     for path in sorted(paths):
@@ -393,7 +504,7 @@ def load_report_family(paths: Sequence[Path], name_map: Dict[str, str]) -> Tuple
             warnings.append(f"Could not read {path}: {exc}")
             continue
 
-        report_kind = detect_report_kind(report)
+        report_kind = detect_report_kind(report, path)
         if report_kind == "unknown":
             warnings.append(f"Skipping {path}: unrecognized JSON structure.")
             continue
@@ -403,7 +514,16 @@ def load_report_family(paths: Sequence[Path], name_map: Dict[str, str]) -> Tuple
         reference_name = apply_name_map(reference_raw, name_map)
         candidate_name = apply_name_map(candidate_raw, name_map)
 
-        if report.get("status") == "failed":
+        if report_kind == "failed":
+            failed_row = extract_failed_report_row(
+                report_path=path,
+                report=report,
+                reference_raw=reference_raw,
+                candidate_raw=candidate_raw,
+                reference_label=reference_name,
+                candidate_label=candidate_name,
+            )
+            failed_rows.append(failed_row)
             pair_rows.append(
                 {
                     "report_path": str(path),
@@ -412,8 +532,11 @@ def load_report_family(paths: Sequence[Path], name_map: Dict[str, str]) -> Tuple
                     "candidate": candidate_name,
                     "reference_raw": reference_raw,
                     "candidate_raw": candidate_raw,
-                    "status": "failed",
-                    "error_message": report.get("error_message"),
+                    "status": failed_row.get("status") or "failed",
+                    "error_message": failed_row.get("error_message"),
+                    "tensor_format": failed_row.get("tensor_format"),
+                    "rtol": failed_row.get("rtol"),
+                    "atol": failed_row.get("atol"),
                 }
             )
             continue
@@ -471,12 +594,13 @@ def load_report_family(paths: Sequence[Path], name_map: Dict[str, str]) -> Tuple
 
     pair_df = pd.DataFrame(pair_rows)
     step_df = pd.DataFrame(step_rows)
+    failed_df = pd.DataFrame(failed_rows)
 
     if not pair_df.empty and {"tensor_step_count", "exact_equal_tensor_step_count", "divergent_tensor_step_count"}.issubset(pair_df.columns):
         pair_df["exact_equal_tensor_step_rate"] = pair_df["exact_equal_tensor_step_count"] / pair_df["tensor_step_count"]
         pair_df["divergent_tensor_step_rate"] = pair_df["divergent_tensor_step_count"] / pair_df["tensor_step_count"]
 
-    return pair_df, step_df, warnings
+    return pair_df, step_df, failed_df, warnings
 
 
 # -----------------------------------------------------------------------------
@@ -485,7 +609,11 @@ def load_report_family(paths: Sequence[Path], name_map: Dict[str, str]) -> Tuple
 
 
 def save_csv(df: pd.DataFrame, path: Path) -> None:
-    df.to_csv(path, index=False)
+    output_df = df.copy()
+    for column in output_df.columns:
+        if is_percent_metric(column) and pd.api.types.is_numeric_dtype(output_df[column]):
+            output_df[column] = output_df[column] * 100.0
+    output_df.to_csv(path, index=False)
 
 
 def aggregate_platform_role(pair_df: pd.DataFrame, role_column: str) -> pd.DataFrame:
@@ -499,6 +627,8 @@ def aggregate_platform_role(pair_df: pd.DataFrame, role_column: str) -> pd.DataF
         "unequal_element_rate",
     ]
     existing_metric_cols = [c for c in metric_cols if c in pair_df.columns]
+    if not existing_metric_cols:
+        return pd.DataFrame(columns=["platform"])
     ok_df = pair_df[pair_df["status"] == "ok"].copy()
     if ok_df.empty:
         return pd.DataFrame(columns=["platform"])
@@ -700,17 +830,19 @@ def plot_numeric_heatmap(
     matrix: pd.DataFrame,
     title: str,
     output_path: Path,
-    cmap: str = "viridis",
+    cmap: str = IEEE_MATRIX_CMAP,
     value_format: str = ".3g",
+    colorbar_label: str = "Value",
 ) -> None:
     if matrix.empty:
         return
 
     values = matrix.to_numpy(dtype=float)
     masked = np.ma.masked_invalid(values)
+    finite_values = values[np.isfinite(values)]
 
     fig, ax = plt.subplots(figsize=(1.2 * max(6, len(matrix.columns)), 0.9 * max(5, len(matrix.index))))
-    im = ax.imshow(masked, cmap=cmap, aspect="auto")
+    im = ax.imshow(masked, cmap=get_ieee_colormap(cmap), aspect="auto")
 
     ax.set_title(title)
     ax.set_xticks(range(len(matrix.columns)))
@@ -722,10 +854,18 @@ def plot_numeric_heatmap(
         for j in range(matrix.shape[1]):
             val = values[i, j]
             text = "-" if math.isnan(val) else format(val, value_format)
-            ax.text(j, i, text, ha="center", va="center", fontsize=8)
+            ax.text(
+                j,
+                i,
+                text,
+                ha="center",
+                va="center",
+                fontsize=8,
+                color=annotation_text_color(val, finite_values),
+            )
 
     cbar = fig.colorbar(im, ax=ax)
-    cbar.ax.set_ylabel("Value", rotation=-90, va="bottom")
+    cbar.ax.set_ylabel(colorbar_label, rotation=-90, va="bottom")
     fig.tight_layout()
     fig.savefig(output_path, dpi=200, bbox_inches="tight")
     plt.close(fig)
@@ -737,16 +877,18 @@ def plot_text_heatmap(
     title: str,
     output_path: Path,
     max_annotation_len: int,
-    cmap: str = "magma",
+    cmap: str = IEEE_MATRIX_CMAP,
+    colorbar_label: str = "Color scale",
 ) -> None:
     if matrix_values.empty or matrix_colors.empty:
         return
 
     color_values = matrix_colors.to_numpy(dtype=float)
     masked = np.ma.masked_invalid(color_values)
+    finite_values = color_values[np.isfinite(color_values)]
 
     fig, ax = plt.subplots(figsize=(1.2 * max(6, len(matrix_values.columns)), 0.9 * max(5, len(matrix_values.index))))
-    im = ax.imshow(masked, cmap=cmap, aspect="auto")
+    im = ax.imshow(masked, cmap=get_ieee_colormap(cmap), aspect="auto")
 
     ax.set_title(title)
     ax.set_xticks(range(len(matrix_values.columns)))
@@ -757,11 +899,20 @@ def plot_text_heatmap(
     for i in range(matrix_values.shape[0]):
         for j in range(matrix_values.shape[1]):
             raw_value = matrix_values.iloc[i, j]
+            color_value = color_values[i, j]
             text = shorten(None if pd.isna(raw_value) else str(raw_value), max_annotation_len) or "-"
-            ax.text(j, i, text, ha="center", va="center", fontsize=8)
+            ax.text(
+                j,
+                i,
+                text,
+                ha="center",
+                va="center",
+                fontsize=8,
+                color=annotation_text_color(color_value, finite_values),
+            )
 
     cbar = fig.colorbar(im, ax=ax)
-    cbar.ax.set_ylabel("Color scale", rotation=-90, va="bottom")
+    cbar.ax.set_ylabel(colorbar_label, rotation=-90, va="bottom")
     fig.tight_layout()
     fig.savefig(output_path, dpi=200, bbox_inches="tight")
     plt.close(fig)
@@ -785,13 +936,55 @@ def plot_top_bar(
     plot_df = plot_df.iloc[::-1]
 
     fig, ax = plt.subplots(figsize=(10, max(5, 0.35 * len(plot_df))))
-    ax.barh(plot_df[category_col].astype(str), plot_df[value_col].astype(float))
+    values = display_metric_series(plot_df[value_col], value_col)
+    ax.barh(plot_df[category_col].astype(str), values.astype(float), color="#4b6f8f")
     ax.set_title(title)
-    ax.set_xlabel(value_col)
+    ax.set_xlabel(percent_label(value_col))
     ax.set_ylabel(category_col)
     fig.tight_layout()
     fig.savefig(output_path, dpi=200, bbox_inches="tight")
     plt.close(fig)
+
+
+# -----------------------------------------------------------------------------
+# Failed-report summary
+# -----------------------------------------------------------------------------
+
+
+def append_failed_report_summary(summary_lines: List[str], failed_df: pd.DataFrame) -> None:
+    """Append a compact failed-comparison summary to the markdown report."""
+    summary_lines.append("## Failed comparison reports")
+    summary_lines.append("")
+    summary_lines.append(f"- Total failed comparison reports: {len(failed_df)}")
+
+    if failed_df.empty:
+        summary_lines.append("")
+        return
+
+    summary_lines.append("")
+    summary_lines.append("### Count by platform pair")
+    for pair, count in failed_df["platform_pair"].value_counts(dropna=False).items():
+        summary_lines.append(f"- `{pair}`: {count}")
+
+    summary_lines.append("")
+    summary_lines.append("### Count by error message")
+    error_counts = failed_df["error_message"].fillna("<missing error_message>").value_counts(dropna=False)
+    for error_message, count in error_counts.items():
+        summary_lines.append(f"- {count}: `{error_message}`")
+
+    summary_lines.append("")
+    summary_lines.append("### Most frequent failures")
+    frequent_failures = (
+        failed_df.assign(error_message=failed_df["error_message"].fillna("<missing error_message>"))
+        .groupby(["platform_pair", "error_message"], dropna=False)
+        .size()
+        .reset_index(name="count")
+        .sort_values(["count", "platform_pair", "error_message"], ascending=[False, True, True])
+        .head(10)
+    )
+    for _, row in frequent_failures.iterrows():
+        summary_lines.append(f"- {int(row['count'])} × `{row['platform_pair']}` — `{row['error_message']}`")
+    summary_lines.append("")
 
 
 # -----------------------------------------------------------------------------
@@ -897,12 +1090,12 @@ def analyze_family(
     save_csv(sym_df, output_dir / f"{family_name}_symmetry_analysis.csv")
 
     numeric_matrix_specs = [
-        ("unequal_element_rate", ".3g", "viridis"),
-        ("divergent_tensor_step_count", ".0f", "magma"),
-        ("divergent_tensor_step_rate", ".3g", "magma"),
-        ("exact_equal_tensor_step_count", ".0f", "cividis"),
-        ("exact_equal_tensor_step_rate", ".3g", "cividis"),
-        ("total_unequal_elements", ".3g", "plasma"),
+        ("unequal_element_rate", ".2f", IEEE_MATRIX_CMAP),
+        ("divergent_tensor_step_count", ".0f", IEEE_MATRIX_CMAP),
+        ("divergent_tensor_step_rate", ".2f", IEEE_MATRIX_CMAP),
+        ("exact_equal_tensor_step_count", ".0f", IEEE_MATRIX_CMAP),
+        ("exact_equal_tensor_step_rate", ".2f", IEEE_MATRIX_CMAP),
+        ("total_unequal_elements", ".3g", IEEE_MATRIX_CMAP),
     ]
 
     for value_col, fmt, cmap in numeric_matrix_specs:
@@ -911,13 +1104,15 @@ def analyze_family(
         matrix = build_matrix(pair_df, value_col)
         if matrix.empty:
             continue
-        matrix.to_csv(output_dir / f"{family_name}_matrix_{value_col}.csv")
+        display_matrix = display_metric_matrix(matrix, value_col)
+        display_matrix.to_csv(output_dir / f"{family_name}_matrix_{value_col}.csv")
         plot_numeric_heatmap(
-            matrix,
-            title=f"{family_name}: {value_col}",
+            display_matrix,
+            title=f"{family_name}: {percent_label(value_col)}",
             output_path=output_dir / f"{family_name}_matrix_{value_col}.png",
             cmap=cmap,
             value_format=fmt,
+            colorbar_label=percent_label(value_col),
         )
 
     text_specs = [
@@ -925,7 +1120,11 @@ def analyze_family(
         "first_divergent_family",
         "first_divergent_step",
     ]
-    color_reference_matrix = build_matrix(pair_df, "unequal_element_rate") if "unequal_element_rate" in pair_df.columns else pd.DataFrame()
+    color_reference_matrix = (
+        display_metric_matrix(build_matrix(pair_df, "unequal_element_rate"), "unequal_element_rate")
+        if "unequal_element_rate" in pair_df.columns
+        else pd.DataFrame()
+    )
 
     for value_col in text_specs:
         if value_col not in pair_df.columns or color_reference_matrix.empty:
@@ -937,14 +1136,15 @@ def analyze_family(
         plot_text_heatmap(
             matrix_values=matrix_text,
             matrix_colors=color_reference_matrix,
-            title=f"{family_name}: {value_col}",
+            title=f"{family_name}: {value_col} (colored by unequal_element_rate %)",
             output_path=output_dir / f"{family_name}_matrix_{value_col}.png",
             max_annotation_len=max_annotation_len,
-            cmap="magma",
+            cmap=IEEE_MATRIX_CMAP,
+            colorbar_label="unequal_element_rate (%)",
         )
 
     outputs["num_ok_pair_reports"] = int((pair_df["status"] == "ok").sum()) if "status" in pair_df.columns else 0
-    outputs["num_failed_pair_reports"] = int((pair_df["status"] == "failed").sum()) if "status" in pair_df.columns else 0
+    outputs["num_failed_pair_reports"] = int((pair_df["report_kind"] == "failed").sum()) if "report_kind" in pair_df.columns else 0
     outputs["num_divergent_steps"] = int(step_df["divergent"].sum()) if "divergent" in step_df.columns else 0
     return outputs
 
@@ -966,15 +1166,46 @@ def main() -> None:
     full_paths = [p for p in full_paths if p not in set(error_paths)]
 
     inventory_rows: List[Dict[str, Any]] = []
-    for path in full_paths:
-        inventory_rows.append({"report_path": str(path), "report_kind": "full"})
-    for path in error_paths:
-        inventory_rows.append({"report_path": str(path), "report_kind": "errors"})
+    for glob_family, paths in [("full", full_paths), ("errors", error_paths)]:
+        for path in paths:
+            try:
+                detected_kind = detect_report_kind(load_json(path), path)
+            except Exception:
+                detected_kind = "unknown"
+            inventory_rows.append(
+                {
+                    "report_path": str(path),
+                    "glob_family": glob_family,
+                    "report_kind": detected_kind,
+                }
+            )
     inventory_df = pd.DataFrame(inventory_rows)
     save_csv(inventory_df, args.output_dir / "reports_inventory.csv")
 
-    full_pair_df, full_step_df, full_warnings = load_report_family(full_paths, name_map)
-    error_pair_df, error_step_df, error_warnings = load_report_family(error_paths, name_map)
+    full_pair_df, full_step_df, full_failed_df, full_warnings = load_report_family(full_paths, name_map)
+    error_pair_df, error_step_df, error_failed_df, error_warnings = load_report_family(error_paths, name_map)
+
+    failed_columns = [
+        "report_path",
+        "reference_dir",
+        "candidate_dir",
+        "reference_label",
+        "candidate_label",
+        "status",
+        "error_message",
+        "tensor_format",
+        "atol",
+        "rtol",
+        "reference_raw",
+        "candidate_raw",
+        "platform_pair",
+    ]
+    failed_reports_df = pd.concat([full_failed_df, error_failed_df], ignore_index=True)
+    if failed_reports_df.empty:
+        failed_reports_df = pd.DataFrame(columns=failed_columns)
+    else:
+        failed_reports_df = failed_reports_df.reindex(columns=failed_columns)
+    save_csv(failed_reports_df, args.output_dir / "failed_reports.csv")
 
     summary_lines: List[str] = []
     summary_lines.append("# Comparison report analysis")
@@ -982,6 +1213,8 @@ def main() -> None:
     summary_lines.append(f"Input directory: `{args.input_dir}`")
     summary_lines.append(f"Full reports found: {len(full_paths)}")
     summary_lines.append(f"Error-only reports found: {len(error_paths)}")
+    summary_lines.append(f"Failed comparison reports found: {len(failed_reports_df)}")
+    summary_lines.append("Rate and fraction metrics in CSV and matrix outputs are reported as percentages.")
     summary_lines.append("")
     if name_map:
         summary_lines.append("Friendly label mappings:")
@@ -1012,6 +1245,8 @@ def main() -> None:
         top_k_operations=args.top_k_operations,
         max_annotation_len=args.max_annotation_len,
     )
+
+    append_failed_report_summary(summary_lines, failed_reports_df)
 
     summary_lines.append("## Output overview")
     summary_lines.append("")

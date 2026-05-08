@@ -25,6 +25,36 @@ def _build_step_map(step_records: List[Dict[str, Any]]) -> Dict[str, Dict[str, A
     return output
 
 
+def _step_detail(record: Dict[str, Any], prefix: str) -> Dict[str, Any]:
+    """Return step metadata fields that help identify comparison errors."""
+    return {
+        f"{prefix}_step_index": record.get("step_index"),
+        f"{prefix}_step_name": record.get("step_name"),
+        f"{prefix}_function_name": record.get("function_name"),
+        f"{prefix}_shape": record.get("shape"),
+        f"{prefix}_dtype": record.get("dtype"),
+    }
+
+
+def _build_step_error_result(
+    *,
+    step_name: str,
+    ref_record: Dict[str, Any],
+    cand_record: Dict[str, Any],
+    error: Exception,
+) -> Dict[str, Any]:
+    """Create a report item for a step that could not be loaded or compared."""
+    result: Dict[str, Any] = {
+        "step_name": step_name,
+        "status": "comparison_error",
+        "error_type": type(error).__name__,
+        "error_message": str(error),
+    }
+    result.update(_step_detail(ref_record, "reference"))
+    result.update(_step_detail(cand_record, "candidate"))
+    return result
+
+
 def _pick_worst_step(
     comparisons: List[Dict[str, Any]],
     metric_key: str,
@@ -60,6 +90,18 @@ def _build_summary(
         item["step_name"]
         for item in comparisons
         if item.get("status") == "non_tensor_output_skipped"
+    ]
+
+    comparison_error_steps = [
+        {
+            "step_name": item.get("step_name"),
+            "reference_function_name": item.get("reference_function_name"),
+            "candidate_function_name": item.get("candidate_function_name"),
+            "error_type": item.get("error_type"),
+            "error_message": item.get("error_message"),
+        }
+        for item in comparisons
+        if item.get("status") == "comparison_error"
     ]
 
     tensor_steps = [
@@ -98,6 +140,7 @@ def _build_summary(
         ),
         "divergent_tensor_step_count": len(divergent_tensor_steps),
         "shape_mismatch_step_count": len(shape_mismatch_steps),
+        "comparison_error_step_count": len(comparison_error_steps),
         "skipped_non_tensor_step_count": len(skipped_non_tensor),
         "missing_in_candidate_count": len(missing_in_candidate),
         "missing_in_reference_count": len(missing_in_reference),
@@ -115,6 +158,7 @@ def _build_summary(
             comparisons, "num_unequal"
         ),
         "shape_mismatch_steps": shape_mismatch_steps,
+        "comparison_error_steps": comparison_error_steps,
         "skipped_non_tensor_steps": skipped_non_tensor,
     }
 
@@ -126,6 +170,10 @@ def _build_errors_only_report(full_report: Dict[str, Any]) -> Dict[str, Any]:
     divergent_steps = []
     for item in full_report["comparisons"]:
         if item.get("status") == "non_tensor_output_skipped":
+            continue
+
+        if item.get("status") == "comparison_error":
+            divergent_steps.append(item)
             continue
 
         if item.get("same_shape") is False:
@@ -176,39 +224,56 @@ def _compare_single_candidate(
     first_divergent_step: Optional[str] = None
 
     for step_name in shared_step_names:
-        ref_shape = ref_steps[step_name]["shape"]
-        cand_shape = cand_steps[step_name]["shape"]
+        ref_record = ref_steps[step_name]
+        cand_record = cand_steps[step_name]
+        ref_shape = ref_record["shape"]
+        cand_shape = cand_record["shape"]
 
         if ref_shape is None or cand_shape is None:
-            comparisons.append(
-                {
-                    "step_name": step_name,
-                    "status": "non_tensor_output_skipped",
-                }
-            )
+            result = {
+                "step_name": step_name,
+                "status": "non_tensor_output_skipped",
+            }
+            result.update(_step_detail(ref_record, "reference"))
+            result.update(_step_detail(cand_record, "candidate"))
+            comparisons.append(result)
             continue
 
-        ref_tensor = load_tensor_any(
-            base_path_without_suffix=reference_dir / "steps" / step_name,
-            fmt=tensor_format,
-            dtype_name=ref_dtype,
-            shape=ref_shape,
-            map_location="cpu",
-        )
-        cand_tensor = load_tensor_any(
-            base_path_without_suffix=candidate_dir / "steps" / step_name,
-            fmt=tensor_format,
-            dtype_name=cand_dtype,
-            shape=cand_shape,
-            map_location="cpu",
-        )
+        try:
+            ref_tensor = load_tensor_any(
+                base_path_without_suffix=reference_dir / "steps" / step_name,
+                fmt=tensor_format,
+                dtype_name=ref_dtype,
+                shape=ref_shape,
+                map_location="cpu",
+            )
+            cand_tensor = load_tensor_any(
+                base_path_without_suffix=candidate_dir / "steps" / step_name,
+                fmt=tensor_format,
+                dtype_name=cand_dtype,
+                shape=cand_shape,
+                map_location="cpu",
+            )
 
-        result = compare_tensors(ref_tensor, cand_tensor, rtol=rtol, atol=atol)
-        result["step_name"] = step_name
-        result["status"] = None
+            result = compare_tensors(ref_tensor, cand_tensor, rtol=rtol, atol=atol)
+            result["step_name"] = step_name
+            result["status"] = None
+            result.update(_step_detail(ref_record, "reference"))
+            result.update(_step_detail(cand_record, "candidate"))
+        except Exception as error:
+            result = _build_step_error_result(
+                step_name=step_name,
+                ref_record=ref_record,
+                cand_record=cand_record,
+                error=error,
+            )
+
         comparisons.append(result)
 
-        if first_divergent_step is None and result.get("exact_equal") is False:
+        if first_divergent_step is None and (
+            result.get("exact_equal") is False
+            or result.get("status") == "comparison_error"
+        ):
             first_divergent_step = step_name
 
     summary = _build_summary(
@@ -287,10 +352,13 @@ def compare_runs(
             print(f"Errors-only report saved to: {errors_only_path}")
 
             first_divergent_step = report["first_divergent_step"]
+            comparison_error_count = report["summary"].get("comparison_error_step_count", 0)
             if first_divergent_step is None:
                 print("No divergence detected in the shared tensor steps.")
             else:
                 print(f"First divergent step: {first_divergent_step}")
+            if comparison_error_count:
+                print(f"Step comparison errors captured: {comparison_error_count}")
 
             aggregate_summary["candidates"].append(
                 {
