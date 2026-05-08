@@ -48,7 +48,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     compare_parser = subparsers.add_parser(
         "compare",
-        help="Compare one reference execution folder against one or more candidate folders",
+        help=(
+            "Compare one reference execution folder against one or more candidate "
+            "folders, capturing per-step load/compare errors in the reports"
+        ),
     )
     compare_parser.add_argument(
         "--reference", type=Path, required=True, help="Reference execution directory"

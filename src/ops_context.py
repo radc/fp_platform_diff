@@ -15,6 +15,11 @@ import torch
 from .io_utils import save_tensor_any
 
 
+def _function_name(function: Any) -> str:
+    """Return a readable name for an operation callable."""
+    return getattr(function, "__name__", type(function).__name__)
+
+
 class OperationContext:
     """Helper object passed to the user-defined operation script."""
 
@@ -64,6 +69,7 @@ class OperationContext:
                     "step_name": step_name,
                     "shape": list(result.shape),
                     "dtype": str(result.dtype),
+                    "function_name": _function_name(function),
                 }
             )
         else:
@@ -73,6 +79,7 @@ class OperationContext:
                     "step_name": step_name,
                     "shape": None,
                     "dtype": str(type(result)),
+                    "function_name": _function_name(function),
                 }
             )
 

@@ -418,6 +418,10 @@ def step_row_from_item(
         "first_diff_reference_value": item.get("first_diff_reference_value"),
         "first_diff_candidate_value": item.get("first_diff_candidate_value"),
         "status": item.get("status"),
+        "error_type": item.get("error_type"),
+        "error_message": item.get("error_message"),
+        "reference_function_name": item.get("reference_function_name"),
+        "candidate_function_name": item.get("candidate_function_name"),
     }
 
 
