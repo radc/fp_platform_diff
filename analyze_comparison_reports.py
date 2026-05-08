@@ -1,18 +1,21 @@
 #!/usr/bin/env python3
-"""Analyze full and error-only cross-platform comparison reports.
+"""Analyze cross-platform comparison reports.
 
-This script extends the previous error-oriented analyzer to support two kinds of
-JSON reports produced by the floating-point comparison pipeline:
+This script extends the previous error-oriented analyzer to support three kinds
+of JSON reports produced by the floating-point comparison pipeline:
 
 1. Full comparison reports, which contain the key ``comparisons`` and therefore
    include *all* evaluated operations, including those that match exactly.
 2. Error-only comparison reports, which contain the key ``divergent_steps`` and
    therefore include only the operations that diverged.
+3. Failed comparison reports, which contain failure metadata such as ``status``
+   and ``error_message`` but no per-step numeric comparison payload.
 
-The script can analyze both report families in a single run and writes separate
+The script can analyze these report families in a single run and writes separate
 CSV/PNG outputs for:
-- all-step analysis (based on full reports), and
-- error-only analysis (based on error reports).
+- all-step analysis (based on full reports),
+- error-only analysis (based on error reports), and
+- failed report inventory/summary output.
 
 It also generates NxN platform matrices, summaries by operation/family/group,
 patch-size analyses, and symmetry analyses comparing A->B against B->A.
@@ -105,7 +108,7 @@ def ensure_dir(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
 
 
-def load_json(path: Path) -> Dict[str, Any]:
+def load_json(path: Path) -> Any:
     with path.open("r", encoding="utf-8") as f:
         return json.load(f)
 
@@ -305,11 +308,22 @@ def operation_group_for_paper(normalized_name: str) -> str:
 # -----------------------------------------------------------------------------
 
 
-def detect_report_kind(report: Dict[str, Any]) -> str:
+def detect_report_kind(report: Any, path: Optional[Path] = None) -> str:
+    """Classify a comparison report JSON payload.
+
+    Supported report kinds are:
+    - ``full``: complete comparison reports with a ``comparisons`` array.
+    - ``errors``: error-only reports with a ``divergent_steps`` array.
+    - ``failed``: comparison jobs that failed before per-step metrics were emitted.
+    """
+    if not isinstance(report, dict):
+        return "unknown"
     if "comparisons" in report:
         return "full"
     if "divergent_steps" in report:
         return "errors"
+    if report.get("status") == "failed" or {"status", "error_message"}.issubset(report):
+        return "failed"
     return "unknown"
 
 
@@ -319,6 +333,33 @@ def iter_report_items(report: Dict[str, Any], report_kind: str) -> Iterable[Dict
     if report_kind == "errors":
         return report.get("divergent_steps", [])
     return []
+
+
+def extract_failed_report_row(
+    *,
+    report_path: Path,
+    report: Dict[str, Any],
+    reference_raw: str,
+    candidate_raw: str,
+    reference_label: str,
+    candidate_label: str,
+) -> Dict[str, Any]:
+    """Extract a row for a report that failed before step-level comparison."""
+    return {
+        "report_path": str(report_path),
+        "reference_dir": report.get("reference_dir"),
+        "candidate_dir": report.get("candidate_dir"),
+        "reference_raw": reference_raw,
+        "candidate_raw": candidate_raw,
+        "reference_label": reference_label,
+        "candidate_label": candidate_label,
+        "platform_pair": f"{reference_label} -> {candidate_label}",
+        "status": report.get("status"),
+        "error_message": report.get("error_message"),
+        "tensor_format": report.get("tensor_format"),
+        "atol": report.get("atol"),
+        "rtol": report.get("rtol"),
+    }
 
 
 def step_row_from_item(
@@ -380,10 +421,11 @@ def step_row_from_item(
     }
 
 
-def load_report_family(paths: Sequence[Path], name_map: Dict[str, str]) -> Tuple[pd.DataFrame, pd.DataFrame, List[str]]:
-    """Load one family of reports and return pair-level and step-level frames."""
+def load_report_family(paths: Sequence[Path], name_map: Dict[str, str]) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, List[str]]:
+    """Load one family of reports and return pair-, step-, and failed-report frames."""
     pair_rows: List[Dict[str, Any]] = []
     step_rows: List[Dict[str, Any]] = []
+    failed_rows: List[Dict[str, Any]] = []
     warnings: List[str] = []
 
     for path in sorted(paths):
@@ -393,7 +435,7 @@ def load_report_family(paths: Sequence[Path], name_map: Dict[str, str]) -> Tuple
             warnings.append(f"Could not read {path}: {exc}")
             continue
 
-        report_kind = detect_report_kind(report)
+        report_kind = detect_report_kind(report, path)
         if report_kind == "unknown":
             warnings.append(f"Skipping {path}: unrecognized JSON structure.")
             continue
@@ -403,7 +445,16 @@ def load_report_family(paths: Sequence[Path], name_map: Dict[str, str]) -> Tuple
         reference_name = apply_name_map(reference_raw, name_map)
         candidate_name = apply_name_map(candidate_raw, name_map)
 
-        if report.get("status") == "failed":
+        if report_kind == "failed":
+            failed_row = extract_failed_report_row(
+                report_path=path,
+                report=report,
+                reference_raw=reference_raw,
+                candidate_raw=candidate_raw,
+                reference_label=reference_name,
+                candidate_label=candidate_name,
+            )
+            failed_rows.append(failed_row)
             pair_rows.append(
                 {
                     "report_path": str(path),
@@ -412,8 +463,11 @@ def load_report_family(paths: Sequence[Path], name_map: Dict[str, str]) -> Tuple
                     "candidate": candidate_name,
                     "reference_raw": reference_raw,
                     "candidate_raw": candidate_raw,
-                    "status": "failed",
-                    "error_message": report.get("error_message"),
+                    "status": failed_row.get("status") or "failed",
+                    "error_message": failed_row.get("error_message"),
+                    "tensor_format": failed_row.get("tensor_format"),
+                    "rtol": failed_row.get("rtol"),
+                    "atol": failed_row.get("atol"),
                 }
             )
             continue
@@ -471,12 +525,13 @@ def load_report_family(paths: Sequence[Path], name_map: Dict[str, str]) -> Tuple
 
     pair_df = pd.DataFrame(pair_rows)
     step_df = pd.DataFrame(step_rows)
+    failed_df = pd.DataFrame(failed_rows)
 
     if not pair_df.empty and {"tensor_step_count", "exact_equal_tensor_step_count", "divergent_tensor_step_count"}.issubset(pair_df.columns):
         pair_df["exact_equal_tensor_step_rate"] = pair_df["exact_equal_tensor_step_count"] / pair_df["tensor_step_count"]
         pair_df["divergent_tensor_step_rate"] = pair_df["divergent_tensor_step_count"] / pair_df["tensor_step_count"]
 
-    return pair_df, step_df, warnings
+    return pair_df, step_df, failed_df, warnings
 
 
 # -----------------------------------------------------------------------------
@@ -499,6 +554,8 @@ def aggregate_platform_role(pair_df: pd.DataFrame, role_column: str) -> pd.DataF
         "unequal_element_rate",
     ]
     existing_metric_cols = [c for c in metric_cols if c in pair_df.columns]
+    if not existing_metric_cols:
+        return pd.DataFrame(columns=["platform"])
     ok_df = pair_df[pair_df["status"] == "ok"].copy()
     if ok_df.empty:
         return pd.DataFrame(columns=["platform"])
@@ -795,6 +852,47 @@ def plot_top_bar(
 
 
 # -----------------------------------------------------------------------------
+# Failed-report summary
+# -----------------------------------------------------------------------------
+
+
+def append_failed_report_summary(summary_lines: List[str], failed_df: pd.DataFrame) -> None:
+    """Append a compact failed-comparison summary to the markdown report."""
+    summary_lines.append("## Failed comparison reports")
+    summary_lines.append("")
+    summary_lines.append(f"- Total failed comparison reports: {len(failed_df)}")
+
+    if failed_df.empty:
+        summary_lines.append("")
+        return
+
+    summary_lines.append("")
+    summary_lines.append("### Count by platform pair")
+    for pair, count in failed_df["platform_pair"].value_counts(dropna=False).items():
+        summary_lines.append(f"- `{pair}`: {count}")
+
+    summary_lines.append("")
+    summary_lines.append("### Count by error message")
+    error_counts = failed_df["error_message"].fillna("<missing error_message>").value_counts(dropna=False)
+    for error_message, count in error_counts.items():
+        summary_lines.append(f"- {count}: `{error_message}`")
+
+    summary_lines.append("")
+    summary_lines.append("### Most frequent failures")
+    frequent_failures = (
+        failed_df.assign(error_message=failed_df["error_message"].fillna("<missing error_message>"))
+        .groupby(["platform_pair", "error_message"], dropna=False)
+        .size()
+        .reset_index(name="count")
+        .sort_values(["count", "platform_pair", "error_message"], ascending=[False, True, True])
+        .head(10)
+    )
+    for _, row in frequent_failures.iterrows():
+        summary_lines.append(f"- {int(row['count'])} × `{row['platform_pair']}` — `{row['error_message']}`")
+    summary_lines.append("")
+
+
+# -----------------------------------------------------------------------------
 # Report-family analysis
 # -----------------------------------------------------------------------------
 
@@ -944,7 +1042,7 @@ def analyze_family(
         )
 
     outputs["num_ok_pair_reports"] = int((pair_df["status"] == "ok").sum()) if "status" in pair_df.columns else 0
-    outputs["num_failed_pair_reports"] = int((pair_df["status"] == "failed").sum()) if "status" in pair_df.columns else 0
+    outputs["num_failed_pair_reports"] = int((pair_df["report_kind"] == "failed").sum()) if "report_kind" in pair_df.columns else 0
     outputs["num_divergent_steps"] = int(step_df["divergent"].sum()) if "divergent" in step_df.columns else 0
     return outputs
 
@@ -966,15 +1064,46 @@ def main() -> None:
     full_paths = [p for p in full_paths if p not in set(error_paths)]
 
     inventory_rows: List[Dict[str, Any]] = []
-    for path in full_paths:
-        inventory_rows.append({"report_path": str(path), "report_kind": "full"})
-    for path in error_paths:
-        inventory_rows.append({"report_path": str(path), "report_kind": "errors"})
+    for glob_family, paths in [("full", full_paths), ("errors", error_paths)]:
+        for path in paths:
+            try:
+                detected_kind = detect_report_kind(load_json(path), path)
+            except Exception:
+                detected_kind = "unknown"
+            inventory_rows.append(
+                {
+                    "report_path": str(path),
+                    "glob_family": glob_family,
+                    "report_kind": detected_kind,
+                }
+            )
     inventory_df = pd.DataFrame(inventory_rows)
     save_csv(inventory_df, args.output_dir / "reports_inventory.csv")
 
-    full_pair_df, full_step_df, full_warnings = load_report_family(full_paths, name_map)
-    error_pair_df, error_step_df, error_warnings = load_report_family(error_paths, name_map)
+    full_pair_df, full_step_df, full_failed_df, full_warnings = load_report_family(full_paths, name_map)
+    error_pair_df, error_step_df, error_failed_df, error_warnings = load_report_family(error_paths, name_map)
+
+    failed_columns = [
+        "report_path",
+        "reference_dir",
+        "candidate_dir",
+        "reference_label",
+        "candidate_label",
+        "status",
+        "error_message",
+        "tensor_format",
+        "atol",
+        "rtol",
+        "reference_raw",
+        "candidate_raw",
+        "platform_pair",
+    ]
+    failed_reports_df = pd.concat([full_failed_df, error_failed_df], ignore_index=True)
+    if failed_reports_df.empty:
+        failed_reports_df = pd.DataFrame(columns=failed_columns)
+    else:
+        failed_reports_df = failed_reports_df.reindex(columns=failed_columns)
+    save_csv(failed_reports_df, args.output_dir / "failed_reports.csv")
 
     summary_lines: List[str] = []
     summary_lines.append("# Comparison report analysis")
@@ -982,6 +1111,7 @@ def main() -> None:
     summary_lines.append(f"Input directory: `{args.input_dir}`")
     summary_lines.append(f"Full reports found: {len(full_paths)}")
     summary_lines.append(f"Error-only reports found: {len(error_paths)}")
+    summary_lines.append(f"Failed comparison reports found: {len(failed_reports_df)}")
     summary_lines.append("")
     if name_map:
         summary_lines.append("Friendly label mappings:")
@@ -1012,6 +1142,8 @@ def main() -> None:
         top_k_operations=args.top_k_operations,
         max_annotation_len=args.max_annotation_len,
     )
+
+    append_failed_report_summary(summary_lines, failed_reports_df)
 
     summary_lines.append("## Output overview")
     summary_lines.append("")
