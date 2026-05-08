@@ -1,0 +1,7 @@
+reference,Platform A:CPU,Platform A:GPU,Platform B:CPU,Platform B:GPU,Platform C:CPU,Platform C:GPU
+Platform A:CPU,,164.0,299.0,163.0,268.0,163.0
+Platform A:GPU,164.0,,166.0,315.0,163.0,315.0
+Platform B:CPU,299.0,166.0,,165.0,269.0,165.0
+Platform B:GPU,163.0,315.0,165.0,,162.0,317.0
+Platform C:CPU,268.0,163.0,269.0,162.0,,162.0
+Platform C:GPU,163.0,315.0,165.0,317.0,162.0,

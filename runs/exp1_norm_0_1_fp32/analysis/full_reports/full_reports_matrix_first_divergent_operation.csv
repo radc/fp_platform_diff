@@ -1,0 +1,7 @@
+reference,Platform A:CPU,Platform A:GPU,Platform B:CPU,Platform B:GPU,Platform C:CPU,Platform C:GPU
+Platform A:CPU,-,pow_pos_a_1p5,pow_pos_a_1p5,pow_pos_a_1p5,pow_pos_a_1p5,pow_pos_a_1p5
+Platform A:GPU,pow_pos_a_1p5,-,pow_pos_a_1p5,cumsum_a_fp64,pow_pos_a_1p5,cumsum_a_fp64
+Platform B:CPU,pow_pos_a_1p5,pow_pos_a_1p5,-,pow_pos_a_1p5,pow_pos_b_1p5,pow_pos_a_1p5
+Platform B:GPU,pow_pos_a_1p5,cumsum_a_fp64,pow_pos_a_1p5,-,pow_pos_a_1p5,
+Platform C:CPU,pow_pos_a_1p5,pow_pos_a_1p5,pow_pos_b_1p5,pow_pos_a_1p5,-,pow_pos_a_1p5
+Platform C:GPU,pow_pos_a_1p5,cumsum_a_fp64,pow_pos_a_1p5,,pow_pos_a_1p5,-

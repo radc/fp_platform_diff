@@ -1,0 +1,7 @@
+reference,Platform A:CPU,Platform A:GPU,Platform B:CPU,Platform B:GPU,Platform C:CPU,Platform C:GPU
+Platform A:CPU,-,power_like,power_like,power_like,power_like,power_like
+Platform A:GPU,power_like,-,power_like,global_cumulative,power_like,global_cumulative
+Platform B:CPU,power_like,power_like,-,power_like,power_like,power_like
+Platform B:GPU,power_like,global_cumulative,power_like,-,power_like,
+Platform C:CPU,power_like,power_like,power_like,power_like,-,power_like
+Platform C:GPU,power_like,global_cumulative,power_like,,power_like,-
